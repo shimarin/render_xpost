@@ -137,34 +137,51 @@ async def fetch_avatar(client: httpx.AsyncClient, url: str) -> cairo.ImageSurfac
 
 
 class _OGPParser(HTMLParser):
-    """og:image URL だけを抽出する軽量パーサ"""
+    """og:image と記事公開日時を抽出する軽量パーサ"""
+    _DATE_PROPS = {
+        "article:published_time",
+        "og:article:published_time",
+        "datePublished",
+        "article:modified_time",
+    }
+
     def __init__(self):
         super().__init__()
         self.image_url: str | None = None
+        self.article_date: str | None = None
 
     def handle_starttag(self, tag, attrs):
-        if self.image_url:
+        if tag != "meta":
             return
-        if tag == "meta":
-            d = dict(attrs)
-            if d.get("property") == "og:image" and "content" in d:
-                self.image_url = d["content"]
+        d = dict(attrs)
+        prop = d.get("property") or d.get("name") or ""
+        content = d.get("content", "")
+        if not self.image_url and prop == "og:image" and content:
+            self.image_url = content
+        if not self.article_date and prop in self._DATE_PROPS and content:
+            self.article_date = content
 
 
-async def fetch_ogp_image(client: httpx.AsyncClient, url: str) -> cairo.ImageSurface | None:
-    """指定URLのページから og:image を取得して ImageSurface を返す。失敗時は None。"""
+async def fetch_ogp_data(
+    client: httpx.AsyncClient, url: str
+) -> tuple[cairo.ImageSurface | None, str | None]:
+    """指定 URL のページから og:image と記事公開日を取得する。
+    返値: (ImageSurface | None, article_date_str | None)
+    失敗時は (None, None)。
+    """
     try:
         r = await client.get(url)
         if "html" not in r.headers.get("content-type", ""):
-            return None
+            return None, None
         parser = _OGPParser()
         parser.feed(r.text)
-        if not parser.image_url:
-            return None
-        return await download_image(client, parser.image_url, referer=url)
+        surf = None
+        if parser.image_url:
+            surf = await download_image(client, parser.image_url, referer=url)
+        return surf, parser.article_date
     except Exception as e:
         print(f"[warn] OGP fetch failed ({url}): {e}", file=sys.stderr)
-        return None
+        return None, None
 
 
 def _make_stub_surface(w: int, h: int) -> cairo.ImageSurface:
@@ -211,6 +228,16 @@ def draw_rounded_rect(cr: cairo.Context, x, y, w, h, r):
     cr.arc(x + w - r, y + h - r, r, 0, math.pi/2)
     cr.arc(x + r, y + h - r, r, math.pi/2, math.pi)
     cr.arc(x + r, y + r, r, math.pi, 3*math.pi/2)
+    cr.close_path()
+
+
+def _top_rounded_rect(cr: cairo.Context, x, y, w, h, r):
+    """上側2角だけ角丸にした矩形パス（下側は直角）"""
+    cr.new_sub_path()
+    cr.arc(x + w - r, y + r, r, -math.pi/2, 0)  # 右上
+    cr.line_to(x + w, y + h)                      # 右下（直角）
+    cr.line_to(x, y + h)                           # 左下（直角）
+    cr.arc(x + r, y + r, r, math.pi, 3*math.pi/2) # 左上
     cr.close_path()
 
 
@@ -411,34 +438,62 @@ def _make_qr_surface(url: str, size: int) -> cairo.ImageSurface:
     return cairo.ImageSurface.create_from_png(buf)
 
 
+def _format_article_date(iso: str) -> str:
+    """記事公開日を「YYYY年MM月DD日」形式に変換する"""
+    dt = datetime.fromisoformat(iso.replace("Z", "+00:00"))
+    return dt.astimezone().strftime("%Y年%m月%d日")
+
+
 def measure_link_card(cr: cairo.Context, url_entity: dict,
-                      ogp_surf: cairo.ImageSurface | None, card_w: int) -> int:
+                      ogp_surf: cairo.ImageSurface | None, card_w: int,
+                      article_date: str | None = None) -> int:
     """リンクカードの高さを計算して返す（描画はしない）"""
     p = PADDING // 2
     img_h = _link_card_img_h(card_w, ogp_surf)
     desc = url_entity.get("description", "")
-    if not desc:
+    date_str = _format_article_date(article_date) if article_date else None
+    if not desc and not date_str:
         return img_h
-    dl = make_pango_layout(cr, desc, 11, color=SUB_COLOR, width_px=card_w)
-    dl.set_height(-3)
-    dl.set_ellipsize(Pango.EllipsizeMode.END)
-    _, desc_h = dl.get_pixel_size()
-    return img_h + p + desc_h
+    text_h = p  # 上パディング
+    if desc:
+        dl = make_pango_layout(cr, desc, 11, color=SUB_COLOR, width_px=card_w - p * 2)
+        dl.set_height(-3)
+        dl.set_ellipsize(Pango.EllipsizeMode.END)
+        _, dh = dl.get_pixel_size()
+        text_h += dh
+    if date_str:
+        dal = make_pango_layout(cr, date_str, 10, color=SUB_COLOR)
+        _, dah = dal.get_pixel_size()
+        text_h += (4 if desc else 0) + dah
+    text_h += p  # 下パディング
+    return img_h + text_h
 
 
 def draw_link_card(cr: cairo.Context, url_entity: dict,
                    ogp_surf: cairo.ImageSurface | None,
-                   x: int, y: int, card_w: int) -> int:
+                   x: int, y: int, card_w: int,
+                   article_date: str | None = None) -> int:
     """リンクカードを描画し、使った高さを返す"""
     p = PADDING // 2
     img_h = _link_card_img_h(card_w, ogp_surf)
+    total_h = measure_link_card(cr, url_entity, ogp_surf, card_w, article_date)
+    has_text_area = total_h > img_h
 
-    # --- 画像エリア（ラウンドレクトクリップ内） ---
+    # --- 全体背景（text areaがある場合）---
+    # カード全体を QUOTE_BG_COLOR で塗りつぶしてから画像を重ねる
+    if has_text_area:
+        draw_rounded_rect(cr, x, y, card_w, total_h, 10)
+        cr.set_source_rgb(*QUOTE_BG_COLOR)
+        cr.fill()
+
+    # --- 画像（text areaがあれば上角丸のみ、なければ全角丸でクリップ）---
     cr.save()
-    draw_rounded_rect(cr, x, y, card_w, img_h, 10)
+    if has_text_area:
+        _top_rounded_rect(cr, x, y, card_w, img_h, 10)
+    else:
+        draw_rounded_rect(cr, x, y, card_w, img_h, 10)
     cr.clip()
 
-    # 画像またはスタブ（センタークロップ）
     img = ogp_surf or _make_stub_surface(card_w, img_h)
     sw, sh = img.get_width(), img.get_height()
     scale = max(card_w / sw, img_h / sh)
@@ -450,9 +505,12 @@ def draw_link_card(cr: cairo.Context, url_entity: dict,
     cr.paint()
     cr.restore()
 
-    # --- グラデーションオーバーレイ（ラウンドレクトクリップ内） ---
+    # --- グラデーションオーバーレイ（画像エリア内）---
     cr.save()
-    draw_rounded_rect(cr, x, y, card_w, img_h, 10)
+    if has_text_area:
+        _top_rounded_rect(cr, x, y, card_w, img_h, 10)
+    else:
+        draw_rounded_rect(cr, x, y, card_w, img_h, 10)
     cr.clip()
 
     grad_top = cairo.LinearGradient(0, y, 0, y + 36)
@@ -471,7 +529,7 @@ def draw_link_card(cr: cairo.Context, url_entity: dict,
 
     cr.restore()
 
-    # --- テキスト・QRオーバーレイ ---
+    # --- テキスト・QRオーバーレイ（画像上）---
 
     # ドメイン（左上）
     domain = url_entity.get("display_url", "").split("/")[0]
@@ -497,22 +555,30 @@ def draw_link_card(cr: cairo.Context, url_entity: dict,
     cr.move_to(x + p, qr_y + (LINK_CARD_QR_SIZE - title_h) // 2)
     PangoCairo.show_layout(cr, title_l)
 
-    # --- 枠線 ---
-    draw_rounded_rect(cr, x, y, card_w, img_h, 10)
+    # --- 枠線（全体の角丸矩形）---
+    draw_rounded_rect(cr, x, y, card_w, total_h, 10)
     cr.set_source_rgb(*QUOTE_BORDER_COLOR)
     cr.set_line_width(1.0)
     cr.stroke()
 
-    # --- 画像下のdescription ---
+    # --- description・日付（背景は全体fill済みのため追加塗りつぶし不要）---
     desc = url_entity.get("description", "")
+    below_y = y + img_h + p
     if desc:
-        desc_l = make_pango_layout(cr, desc, 11, color=SUB_COLOR, width_px=card_w)
+        desc_l = make_pango_layout(cr, desc, 11, color=SUB_COLOR, width_px=card_w - p * 2)
         desc_l.set_height(-3)
         desc_l.set_ellipsize(Pango.EllipsizeMode.END)
-        cr.move_to(x, y + img_h + p)
+        cr.move_to(x + p, below_y)
         PangoCairo.show_layout(cr, desc_l)
+        _, desc_h = desc_l.get_pixel_size()
+        below_y += desc_h
+    if article_date:
+        date_str = _format_article_date(article_date)
+        date_l = make_pango_layout(cr, date_str, 10, color=SUB_COLOR)
+        cr.move_to(x + p, below_y + (4 if desc else 0))
+        PangoCairo.show_layout(cr, date_l)
 
-    return measure_link_card(cr, url_entity, ogp_surf, card_w)
+    return total_h
 
 
 # ---------- メイン描画 ----------
@@ -531,6 +597,16 @@ def draw_avatar(cr: cairo.Context, surf: cairo.ImageSurface | None,
         cr.set_source_rgb(*ACCENT_COLOR)
         cr.paint()
     cr.restore()
+
+
+def _find_card_entity(tweet: dict, exclude_tco: set) -> dict | None:
+    """tweet の entities.urls から リンクカード対象エントリを返す。なければ None。"""
+    for ent in tweet.get("entities", {}).get("urls", []):
+        if "media_key" in ent or ent["url"] in exclude_tco:
+            continue
+        if ent.get("title"):
+            return ent
+    return None
 
 
 async def render_single_post(tweet_id: str, theme: str = "dark") -> bytes:
@@ -583,13 +659,7 @@ async def render_single_post(tweet_id: str, theme: str = "dark") -> bytes:
                 break
 
         # リンクカードエンティティを特定（title を持つ最初の外部URL）
-        card_ent = None
-        for ent in tweet.get("entities", {}).get("urls", []):
-            if "media_key" in ent or ent["url"] in quote_tco_urls:
-                continue
-            if ent.get("title"):
-                card_ent = ent
-                break
+        card_ent = _find_card_entity(tweet, quote_tco_urls)
 
         # リンクカードのt.co URLも本文から除去する
         exclude_tco = set(quote_tco_urls)
@@ -603,7 +673,7 @@ async def render_single_post(tweet_id: str, theme: str = "dark") -> bytes:
             download_tasks.append(fetch_avatar(client,q_user.get("profile_image_url", "")))
         if card_ent:
             ogp_url = card_ent.get("unwound_url") or card_ent.get("expanded_url")
-            download_tasks.append(fetch_ogp_image(client, ogp_url))
+            download_tasks.append(fetch_ogp_data(client, ogp_url))
 
         results = await asyncio.gather(*download_tasks)
 
@@ -612,7 +682,7 @@ async def render_single_post(tweet_id: str, theme: str = "dark") -> bytes:
         photo_surfs = [s for s in results[idx:idx + len(photos)] if s]; idx += len(photos)
         q_avatar_surf = results[idx] if q_user else None
         if q_user: idx += 1
-        ogp_surf = results[idx] if card_ent else None
+        ogp_surf, article_date = results[idx] if card_ent else (None, None)
 
     # 本文マークアップ（引用URL・メディアURL・カードURL除去、通常URLはリンク表示）
     url_entities = tweet.get("entities", {}).get("urls", [])
@@ -646,7 +716,7 @@ async def render_single_post(tweet_id: str, theme: str = "dark") -> bytes:
 
     link_card_h = 0
     if card_ent:
-        link_card_h = measure_link_card(tmp_cr, card_ent, ogp_surf, text_width) + PADDING
+        link_card_h = measure_link_card(tmp_cr, card_ent, ogp_surf, text_width, article_date) + PADDING
 
     metrics_h = 28
     footer_h = metrics_h + PADDING * 2
@@ -704,7 +774,7 @@ async def render_single_post(tweet_id: str, theme: str = "dark") -> bytes:
 
     # リンクカード
     if card_ent:
-        draw_link_card(cr, card_ent, ogp_surf, PADDING, cur_y, text_width)
+        draw_link_card(cr, card_ent, ogp_surf, PADDING, cur_y, text_width, article_date)
         cur_y += link_card_h
 
     # 日時
@@ -734,6 +804,57 @@ async def render_single_post(tweet_id: str, theme: str = "dark") -> bytes:
         PangoCairo.show_layout(cr, layout_m)
         w, _ = layout_m.get_pixel_size()
         mx += w + 32
+
+    buf = io.BytesIO()
+    surf.write_to_png(buf)
+    return buf.getvalue()
+
+
+async def render_auto(tweet_id: str, theme: str = "dark") -> bytes:
+    """リンクカードがあればカード単独を、なければポスト全体をレンダリングする。
+    カードあり: API 1回 / カードなし: API 2回（1回目の判定 + 2回目のフル描画）。
+    """
+    try:
+        return await render_link_card(tweet_id, theme)
+    except ValueError:
+        return await render_single_post(tweet_id, theme)
+
+
+async def render_link_card(tweet_id: str, theme: str = "dark") -> bytes:
+    """ポストに含まれるリンクカードのみを描画して PNG バイト列を返す。
+    リンクカードが存在しない場合は ValueError を送出する。
+    """
+    apply_theme(theme)
+    tweet_id = _resolve_tweet_id(tweet_id)
+
+    _browser_ua = ("Mozilla/5.0 (X11; Linux x86_64) "
+                   "AppleWebKit/537.36 (KHTML, like Gecko) "
+                   "Chrome/124.0.0.0 Safari/537.36")
+    async with httpx.AsyncClient(
+        headers={"User-Agent": _browser_ua},
+        follow_redirects=True,
+        timeout=30,
+    ) as client:
+        data = await fetch_tweet(client, tweet_id)
+        tweet = data["data"]
+
+        card_ent = _find_card_entity(tweet, set())
+        if card_ent is None:
+            raise ValueError(f"No link card found in tweet {tweet_id}")
+
+        ogp_url = card_ent.get("unwound_url") or card_ent.get("expanded_url")
+        ogp_surf, article_date = await fetch_ogp_data(client, ogp_url)
+
+    p = PADDING // 2
+    text_width = WIDTH - PADDING * 2
+    tmp_surf = cairo.ImageSurface(cairo.FORMAT_ARGB32, WIDTH, 100)
+    tmp_cr = cairo.Context(tmp_surf)
+    card_h = measure_link_card(tmp_cr, card_ent, ogp_surf, text_width, article_date)
+    total_h = p + card_h + p
+
+    surf = cairo.ImageSurface(cairo.FORMAT_ARGB32, WIDTH, total_h)
+    cr = cairo.Context(surf)
+    draw_link_card(cr, card_ent, ogp_surf, PADDING, p, text_width, article_date)
 
     buf = io.BytesIO()
     surf.write_to_png(buf)
