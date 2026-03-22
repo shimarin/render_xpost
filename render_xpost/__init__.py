@@ -8,6 +8,7 @@ import math
 import io
 import html
 import re
+from html.parser import HTMLParser
 from pathlib import Path
 from datetime import datetime
 
@@ -17,7 +18,7 @@ gi.require_version('Pango', '1.0')
 gi.require_version('PangoCairo', '1.0')
 from gi.repository import Pango, PangoCairo
 
-import aiohttp
+import httpx
 
 # --- 設定 ---
 WIDTH = 600
@@ -26,6 +27,7 @@ AVATAR_SIZE = 48
 QUOTE_AVATAR_SIZE = 32
 FONT_FAMILY = "Sans"
 MEDIA_RADIUS = 12
+LINK_CARD_QR_SIZE = 100
 
 THEMES = {
     "dark": dict(
@@ -93,7 +95,7 @@ def set_bearer_token(token: str):
     _bearer_token = token
 
 
-async def fetch_tweet(session: aiohttp.ClientSession, tweet_id: str) -> dict:
+async def fetch_tweet(client: httpx.AsyncClient, tweet_id: str) -> dict:
     if _bearer_token is None:
         raise RuntimeError("Bearer token is not set. Call set_bearer_token() before rendering.")
     url = f"https://api.x.com/2/tweets/{tweet_id}"
@@ -103,16 +105,18 @@ async def fetch_tweet(session: aiohttp.ClientSession, tweet_id: str) -> dict:
         "user.fields": "name,username,profile_image_url",
         "media.fields": "type,url,preview_image_url,width,height,alt_text",
     }
-    async with session.get(url, headers={"Authorization": f"Bearer {_bearer_token}"}, params=params) as r:
-        r.raise_for_status()
-        return await r.json()
+    r = await client.get(url, headers={"Authorization": f"Bearer {_bearer_token}"}, params=params)
+    r.raise_for_status()
+    return r.json()
 
 
-async def download_image(session: aiohttp.ClientSession, url: str) -> cairo.ImageSurface | None:
+async def download_image(client: httpx.AsyncClient, url: str,
+                         referer: str | None = None) -> cairo.ImageSurface | None:
     try:
-        async with session.get(url, allow_redirects=True) as r:
-            r.raise_for_status()
-            data = await r.read()
+        headers = {"Referer": referer} if referer else {}
+        r = await client.get(url, headers=headers)
+        r.raise_for_status()
+        data = r.content
         if data[:4] == b'\x89PNG':
             surf = cairo.ImageSurface.create_from_png(io.BytesIO(data))
         else:
@@ -128,8 +132,61 @@ async def download_image(session: aiohttp.ClientSession, url: str) -> cairo.Imag
         return None
 
 
-async def fetch_avatar(session: aiohttp.ClientSession, url: str) -> cairo.ImageSurface | None:
-    return await download_image(session, url.replace("_normal", "_bigger"))
+async def fetch_avatar(client: httpx.AsyncClient, url: str) -> cairo.ImageSurface | None:
+    return await download_image(client, url.replace("_normal", "_bigger"))
+
+
+class _OGPParser(HTMLParser):
+    """og:image URL だけを抽出する軽量パーサ"""
+    def __init__(self):
+        super().__init__()
+        self.image_url: str | None = None
+
+    def handle_starttag(self, tag, attrs):
+        if self.image_url:
+            return
+        if tag == "meta":
+            d = dict(attrs)
+            if d.get("property") == "og:image" and "content" in d:
+                self.image_url = d["content"]
+
+
+async def fetch_ogp_image(client: httpx.AsyncClient, url: str) -> cairo.ImageSurface | None:
+    """指定URLのページから og:image を取得して ImageSurface を返す。失敗時は None。"""
+    try:
+        r = await client.get(url)
+        if "html" not in r.headers.get("content-type", ""):
+            return None
+        parser = _OGPParser()
+        parser.feed(r.text)
+        if not parser.image_url:
+            return None
+        return await download_image(client, parser.image_url, referer=url)
+    except Exception as e:
+        print(f"[warn] OGP fetch failed ({url}): {e}", file=sys.stderr)
+        return None
+
+
+def _make_stub_surface(w: int, h: int) -> cairo.ImageSurface:
+    """OGP画像取得失敗時のスタブ（ページアイコン風）を生成する"""
+    surf = cairo.ImageSurface(cairo.FORMAT_ARGB32, w, h)
+    cr = cairo.Context(surf)
+    cr.set_source_rgb(*QUOTE_BG_COLOR)
+    cr.paint()
+    # ページアイコン: 中央に小さな矩形＋横線2本
+    iw, ih = w * 0.35, h * 0.45
+    ix, iy = (w - iw) / 2, (h - ih) / 2
+    cr.set_source_rgb(*QUOTE_BORDER_COLOR)
+    cr.set_line_width(1.5)
+    draw_rounded_rect(cr, ix, iy, iw, ih, 2)
+    cr.stroke()
+    lx1, lx2 = ix + iw * 0.15, ix + iw * 0.85
+    for frac in (0.38, 0.58, 0.75):
+        ly = iy + ih * frac
+        cr.move_to(lx1, ly)
+        cr.line_to(lx2, ly)
+        cr.stroke()
+    return surf
 
 
 def make_pango_layout(cr: cairo.Context, text: str, size_pt: float,
@@ -326,6 +383,138 @@ def draw_quote_card(cr: cairo.Context, q_tweet: dict, q_user: dict,
     return card_h
 
 
+# ---------- リンクカード ----------
+
+def _link_card_img_h(card_w: int, ogp_surf: cairo.ImageSurface | None) -> int:
+    """OGP画像のアスペクト比に合わせた表示高さを返す（最大16:9）"""
+    max_h = card_w * 9 // 16
+    if ogp_surf:
+        sw, sh = ogp_surf.get_width(), ogp_surf.get_height()
+        return min(int(card_w * sh / sw), max_h)
+    return max_h
+
+
+def _make_qr_surface(url: str, size: int) -> cairo.ImageSurface:
+    import qrcode
+    from PIL import Image as PilImage
+    qr = qrcode.QRCode(
+        error_correction=qrcode.constants.ERROR_CORRECT_M,
+        box_size=10, border=1,
+    )
+    qr.add_data(url)
+    qr.make(fit=True)
+    pil_img = qr.make_image(fill_color="black", back_color="white").convert("RGBA")
+    pil_img = pil_img.resize((size, size), PilImage.NEAREST)
+    buf = io.BytesIO()
+    pil_img.save(buf, "PNG")
+    buf.seek(0)
+    return cairo.ImageSurface.create_from_png(buf)
+
+
+def measure_link_card(cr: cairo.Context, url_entity: dict,
+                      ogp_surf: cairo.ImageSurface | None, card_w: int) -> int:
+    """リンクカードの高さを計算して返す（描画はしない）"""
+    p = PADDING // 2
+    img_h = _link_card_img_h(card_w, ogp_surf)
+    desc = url_entity.get("description", "")
+    if not desc:
+        return img_h
+    dl = make_pango_layout(cr, desc, 11, color=SUB_COLOR, width_px=card_w)
+    dl.set_height(-3)
+    dl.set_ellipsize(Pango.EllipsizeMode.END)
+    _, desc_h = dl.get_pixel_size()
+    return img_h + p + desc_h
+
+
+def draw_link_card(cr: cairo.Context, url_entity: dict,
+                   ogp_surf: cairo.ImageSurface | None,
+                   x: int, y: int, card_w: int) -> int:
+    """リンクカードを描画し、使った高さを返す"""
+    p = PADDING // 2
+    img_h = _link_card_img_h(card_w, ogp_surf)
+
+    # --- 画像エリア（ラウンドレクトクリップ内） ---
+    cr.save()
+    draw_rounded_rect(cr, x, y, card_w, img_h, 10)
+    cr.clip()
+
+    # 画像またはスタブ（センタークロップ）
+    img = ogp_surf or _make_stub_surface(card_w, img_h)
+    sw, sh = img.get_width(), img.get_height()
+    scale = max(card_w / sw, img_h / sh)
+    ox = (card_w - sw * scale) / 2
+    oy = (img_h - sh * scale) / 2
+    cr.translate(x + ox, y + oy)
+    cr.scale(scale, scale)
+    cr.set_source_surface(img, 0, 0)
+    cr.paint()
+    cr.restore()
+
+    # --- グラデーションオーバーレイ（ラウンドレクトクリップ内） ---
+    cr.save()
+    draw_rounded_rect(cr, x, y, card_w, img_h, 10)
+    cr.clip()
+
+    grad_top = cairo.LinearGradient(0, y, 0, y + 36)
+    grad_top.add_color_stop_rgba(0, 0, 0, 0, 0.55)
+    grad_top.add_color_stop_rgba(1, 0, 0, 0, 0)
+    cr.set_source(grad_top)
+    cr.rectangle(x, y, card_w, 36)
+    cr.fill()
+
+    grad_bot = cairo.LinearGradient(0, y + img_h // 2, 0, y + img_h)
+    grad_bot.add_color_stop_rgba(0, 0, 0, 0, 0)
+    grad_bot.add_color_stop_rgba(1, 0, 0, 0, 0.70)
+    cr.set_source(grad_bot)
+    cr.rectangle(x, y + img_h // 2, card_w, img_h // 2)
+    cr.fill()
+
+    cr.restore()
+
+    # --- テキスト・QRオーバーレイ ---
+
+    # ドメイン（左上）
+    domain = url_entity.get("display_url", "").split("/")[0]
+    domain_l = make_pango_layout(cr, domain, 10, color=(1.0, 1.0, 1.0))
+    cr.move_to(x + p, y + p)
+    PangoCairo.show_layout(cr, domain_l)
+
+    # QRコード（右下）- t.co短縮URLでシンプルに
+    qr_url = url_entity.get("url", "")
+    qr_surf = _make_qr_surface(qr_url, LINK_CARD_QR_SIZE)
+    qr_x = x + card_w - p - LINK_CARD_QR_SIZE
+    qr_y = y + img_h - p - LINK_CARD_QR_SIZE
+    cr.set_source_surface(qr_surf, qr_x, qr_y)
+    cr.paint()
+
+    # タイトル（左下、QRと縦センタリング）
+    title_w = card_w - LINK_CARD_QR_SIZE - p * 3
+    title_l = make_pango_layout(cr, url_entity.get("title", ""), 13,
+                                bold=True, color=(1.0, 1.0, 1.0), width_px=title_w)
+    title_l.set_height(-2)
+    title_l.set_ellipsize(Pango.EllipsizeMode.END)
+    _, title_h = title_l.get_pixel_size()
+    cr.move_to(x + p, qr_y + (LINK_CARD_QR_SIZE - title_h) // 2)
+    PangoCairo.show_layout(cr, title_l)
+
+    # --- 枠線 ---
+    draw_rounded_rect(cr, x, y, card_w, img_h, 10)
+    cr.set_source_rgb(*QUOTE_BORDER_COLOR)
+    cr.set_line_width(1.0)
+    cr.stroke()
+
+    # --- 画像下のdescription ---
+    desc = url_entity.get("description", "")
+    if desc:
+        desc_l = make_pango_layout(cr, desc, 11, color=SUB_COLOR, width_px=card_w)
+        desc_l.set_height(-3)
+        desc_l.set_ellipsize(Pango.EllipsizeMode.END)
+        cr.move_to(x, y + img_h + p)
+        PangoCairo.show_layout(cr, desc_l)
+
+    return measure_link_card(cr, url_entity, ogp_surf, card_w)
+
+
 # ---------- メイン描画 ----------
 
 def draw_avatar(cr: cairo.Context, surf: cairo.ImageSurface | None,
@@ -348,9 +537,16 @@ async def render_single_post(tweet_id: str, theme: str = "dark") -> bytes:
     apply_theme(theme)
     tweet_id = _resolve_tweet_id(tweet_id)
 
-    async with aiohttp.ClientSession() as session:
+    _browser_ua = ("Mozilla/5.0 (X11; Linux x86_64) "
+                   "AppleWebKit/537.36 (KHTML, like Gecko) "
+                   "Chrome/124.0.0.0 Safari/537.36")
+    async with httpx.AsyncClient(
+        headers={"User-Agent": _browser_ua},
+        follow_redirects=True,
+        timeout=30,
+    ) as client:
         # --- データ取得 ---
-        data = await fetch_tweet(session, tweet_id)
+        data = await fetch_tweet(client, tweet_id)
         tweet = data["data"]
         includes = data.get("includes", {})
 
@@ -386,21 +582,41 @@ async def render_single_post(tweet_id: str, theme: str = "dark") -> bytes:
                         quote_tco_urls.add(ent["url"])
                 break
 
+        # リンクカードエンティティを特定（title を持つ最初の外部URL）
+        card_ent = None
+        for ent in tweet.get("entities", {}).get("urls", []):
+            if "media_key" in ent or ent["url"] in quote_tco_urls:
+                continue
+            if ent.get("title"):
+                card_ent = ent
+                break
+
+        # リンクカードのt.co URLも本文から除去する
+        exclude_tco = set(quote_tco_urls)
+        if card_ent:
+            exclude_tco.add(card_ent["url"])
+
         # --- 画像を並列ダウンロード ---
-        download_tasks = [fetch_avatar(session, user.get("profile_image_url", ""))]
-        download_tasks += [download_image(session, p["url"]) for p in photos]
+        download_tasks = [fetch_avatar(client,user.get("profile_image_url", ""))]
+        download_tasks += [download_image(client, p["url"]) for p in photos]
         if q_user:
-            download_tasks.append(fetch_avatar(session, q_user.get("profile_image_url", "")))
+            download_tasks.append(fetch_avatar(client,q_user.get("profile_image_url", "")))
+        if card_ent:
+            ogp_url = card_ent.get("unwound_url") or card_ent.get("expanded_url")
+            download_tasks.append(fetch_ogp_image(client, ogp_url))
 
         results = await asyncio.gather(*download_tasks)
 
-        avatar_surf = results[0]
-        photo_surfs = [s for s in results[1:1 + len(photos)] if s]
-        q_avatar_surf = results[1 + len(photos)] if q_user else None
+        idx = 0
+        avatar_surf = results[idx]; idx += 1
+        photo_surfs = [s for s in results[idx:idx + len(photos)] if s]; idx += len(photos)
+        q_avatar_surf = results[idx] if q_user else None
+        if q_user: idx += 1
+        ogp_surf = results[idx] if card_ent else None
 
-    # 本文マークアップ（引用URL・メディアURL除去、通常URLはリンク表示）
+    # 本文マークアップ（引用URL・メディアURL・カードURL除去、通常URLはリンク表示）
     url_entities = tweet.get("entities", {}).get("urls", [])
-    body_markup = build_body_markup(tweet["text"], url_entities, exclude_tco=quote_tco_urls)
+    body_markup = build_body_markup(tweet["text"], url_entities, exclude_tco=exclude_tco)
 
     metrics = tweet.get("public_metrics", {})
     created = format_date(tweet.get("created_at", ""))
@@ -428,9 +644,13 @@ async def render_single_post(tweet_id: str, theme: str = "dark") -> bytes:
     if q_tweet and q_user:
         quote_h = measure_quote_card(tmp_cr, q_tweet, q_user, text_width) + PADDING
 
+    link_card_h = 0
+    if card_ent:
+        link_card_h = measure_link_card(tmp_cr, card_ent, ogp_surf, text_width) + PADDING
+
     metrics_h = 28
     footer_h = metrics_h + PADDING * 2
-    total_h = body_top + body_h + PADDING + media_h + quote_h + footer_h + PADDING
+    total_h = body_top + body_h + PADDING + media_h + quote_h + link_card_h + footer_h + PADDING
 
     # --- 本描画 ---
     surf = cairo.ImageSurface(cairo.FORMAT_ARGB32, WIDTH, total_h)
@@ -481,6 +701,11 @@ async def render_single_post(tweet_id: str, theme: str = "dark") -> bytes:
         draw_quote_card(cr, q_tweet, q_user, q_avatar_surf,
                         PADDING, cur_y, text_width)
         cur_y += quote_h
+
+    # リンクカード
+    if card_ent:
+        draw_link_card(cr, card_ent, ogp_surf, PADDING, cur_y, text_width)
+        cur_y += link_card_h
 
     # 日時
     layout3 = make_pango_layout(cr, created, 11, color=SUB_COLOR)

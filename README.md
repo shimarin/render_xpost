@@ -55,7 +55,7 @@ python -m render_xpost <token_file> <tweet_id_or_url> [output.png] [--light]
 |---|---|---|
 | pycairo | 画像描画 | emerge (`dev-python/pycairo`) |
 | pygobject / Pango / PangoCairo | テキストレイアウト | emerge (`dev-python/pygobject`) |
-| aiohttp | 非同期HTTP通信 | emerge (`dev-python/aiohttp`) |
+| httpx | 非同期HTTP通信 | emerge (`dev-python/httpx`) |
 | Pillow | アバター等のJPEG→PNG変換 | emerge (`dev-python/pillow`) |
 | STIX Two Math フォント | 𝕏 ロゴ文字 (U+1D54F) | emerge (`media-fonts/stix-fonts`) |
 
