@@ -100,7 +100,7 @@ async def fetch_tweet(client: httpx.AsyncClient, tweet_id: str) -> dict:
         raise RuntimeError("Bearer token is not set. Call set_bearer_token() before rendering.")
     url = f"https://api.x.com/2/tweets/{tweet_id}"
     params = {
-        "tweet.fields": "created_at,text,public_metrics,author_id,attachments,entities,referenced_tweets",
+        "tweet.fields": "created_at,text,public_metrics,author_id,attachments,entities,referenced_tweets,note_tweet",
         "expansions": "author_id,attachments.media_keys,referenced_tweets.id,referenced_tweets.id.author_id",
         "user.fields": "name,username,profile_image_url",
         "media.fields": "type,url,preview_image_url,width,height,alt_text",
@@ -599,12 +599,27 @@ def draw_avatar(cr: cairo.Context, surf: cairo.ImageSurface | None,
     cr.restore()
 
 
+def _effective_text_and_urls(tweet: dict) -> tuple[str, list]:
+    """note_tweet (長文ツイート) がある場合はそちらのテキストと URL エンティティを返す。
+    通常ツイートでは text / entities.urls をそのまま返す。
+    """
+    if "note_tweet" in tweet:
+        nt = tweet["note_tweet"]
+        return nt.get("text", tweet["text"]), nt.get("entities", {}).get("urls", [])
+    return tweet["text"], tweet.get("entities", {}).get("urls", [])
+
+
 def _find_card_entity(tweet: dict, exclude_tco: set) -> dict | None:
-    """tweet の entities.urls から リンクカード対象エントリを返す。なければ None。"""
-    for ent in tweet.get("entities", {}).get("urls", []):
+    """tweet の entities.urls から リンクカード対象エントリを返す。なければ None。
+    通常ツイートでは API が付与する title の有無でカードを判定する。
+    Note Tweet では title が付与されないため、外部 URL をそのままカード候補とする。
+    """
+    is_note = "note_tweet" in tweet
+    _, url_entities = _effective_text_and_urls(tweet)
+    for ent in url_entities:
         if "media_key" in ent or ent["url"] in exclude_tco:
             continue
-        if ent.get("title"):
+        if ent.get("title") or is_note:
             return ent
     return None
 
@@ -652,7 +667,8 @@ async def render_single_post(tweet_id: str, theme: str = "dark") -> bytes:
                     q_tweet = q_tweets[qid]
                     q_user = user_map.get(q_tweet.get("author_id", ""))
                 # 引用ツイートに対応するt.co URLを除去対象に
-                for ent in tweet.get("entities", {}).get("urls", []):
+                _, _all_urls = _effective_text_and_urls(tweet)
+                for ent in _all_urls:
                     exp = ent.get("expanded_url", "")
                     if qid in exp and ("twitter.com" in exp or "x.com" in exp):
                         quote_tco_urls.add(ent["url"])
@@ -685,8 +701,8 @@ async def render_single_post(tweet_id: str, theme: str = "dark") -> bytes:
         ogp_surf, article_date = results[idx] if card_ent else (None, None)
 
     # 本文マークアップ（引用URL・メディアURL・カードURL除去、通常URLはリンク表示）
-    url_entities = tweet.get("entities", {}).get("urls", [])
-    body_markup = build_body_markup(tweet["text"], url_entities, exclude_tco=exclude_tco)
+    tweet_text, url_entities = _effective_text_and_urls(tweet)
+    body_markup = build_body_markup(tweet_text, url_entities, exclude_tco=exclude_tco)
 
     metrics = tweet.get("public_metrics", {})
     created = format_date(tweet.get("created_at", ""))
